@@ -54,7 +54,7 @@ DeepRecon/
 
 ```bash
 # Clone your repo (replace with your repo URL)
-git clone REPO_URL
+git clone https://github.com/senyx122/DeepRecon.git
 cd DeepRecon
 
 # Make the script executable
