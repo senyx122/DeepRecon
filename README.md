@@ -39,7 +39,7 @@ DeepRecon is a powerful, all-in-one Bash-based reconnaissance automation tool de
 ```
 
 DeepRecon/
-├─ DeepRecon                # executable script (chmod +x)
+├─ deeprecon                # executable script (chmod +x)
 ├─ README.md
 ├─ .gitignore
 ├─ LICENSE
@@ -58,10 +58,10 @@ git clone https://github.com/senyx122/DeepRecon.git
 cd DeepRecon
 
 # Make the script executable
-chmod +x DeepRecon
+chmod +x deeprecon
 
 # Optional: move it to PATH for global usage
-sudo mv DeepRecon /usr/local/bin/deeprecon
+sudo mv deeprecon /usr/local/bin/deeprecon
 
 # Test
 deeprecon -h
