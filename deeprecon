@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+#  Colors
+GREEN="\e[32m"
+RED="\e[31m"
+BLUE="\e[34m"
+YELLOW="\e[33m"
+NC="\e[0m"
+
+#  Default 
+TIMEOUT_DURATION="10m"   
+THREADS=50
+OUT_BASE="DeepRecon_Results"
+TIMEOUT_TOOLS=()         
+REQUIRED_TOOLS=(
+  subfinder
+  assetfinder
+  findomain
+  httpx
+  katana
+  waybackurls
+  gau
+  jsecret
+  curl
+  md5sum
+)
+
+#  banner
+banner() {
+cat << "EOF"
+
+██████╗ ███████╗███████╗██████╗ ██████╗ ███████╗ ██████╗ ███╗   ██╗
+██╔══██╗██╔════╝██╔════╝██╔══██╗██╔══██╗██╔════╝██╔═══██╗████╗  ██║
+██║  ██║█████╗  █████╗  ██████╔╝██████╔╝█████╗  ██║   ██║██╔██╗ ██║
+██║  ██║██╔══╝  ██╔══╝  ██╔═══╝ ██╔══██╗██╔══╝  ██║   ██║██║╚██╗██║
+██████╔╝███████╗███████╗██║     ██║  ██║███████╗╚██████╔╝██║ ╚████║
+╚═════╝ ╚══════╝╚══════╝╚═╝     ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝
+
+EOF
+}
+
+#  Tool Installers 
+install_tool() {
+    local tool="$1"
+    echo -e "${YELLOW}[!] Installing $tool ...${NC}"
+
+    case "$tool" in
+        subfinder)
+            go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+            ;;
+        httpx)
+            go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+            ;;
+        katana)
+            go install github.com/projectdiscovery/katana/cmd/katana@latest
+            ;;
+        assetfinder)
+            go install github.com/tomnomnom/assetfinder@latest
+            ;;
+        waybackurls)
+            go install github.com/tomnomnom/waybackurls@latest
+            ;;
+        gau)
+            go install github.com/lc/gau/v2/cmd/gau@latest
+            ;;
+        jsecret)
+            go install github.com/raoufmaklouf/jsecret@latest
+            ;;
+        findomain)
+            if ! command -v findomain &>/dev/null; then
+                wget -q https://github.com/findomain/findomain/releases/latest/download/findomain-linux -O /usr/bin/findomain
+                chmod +x /usr/bin/findomain
+            fi
+            ;;
+        curl)
+
+            if command -v apt-get &>/dev/null; then
+                sudo apt-get update && sudo apt-get install -y curl
+            elif command -v yum &>/dev/null; then
+                sudo yum install -y curl
+            else
+                echo -e "${RED}[-] Please install curl manually${NC}"
+                return 1
+            fi
+            ;;
+        md5sum)
+            # coreutils usually present; else user must install
+            echo -e "${YELLOW}[!] Ensure coreutils/md5sum is installed${NC}"
+            ;;
+        *)
+            echo -e "${RED}[-] No installer for $tool (manual install required)${NC}"
+            return 1
+            ;;
+    esac
+
+    # try to ensure go bin location is on PATH for current shell run (best-effort)
+    if command -v go &>/dev/null; then
+        GOBIN_PATH="$(go env GOBIN 2>/dev/null || true)"
+        if [[ -z "$GOBIN_PATH" ]]; then
+            GOPATH="$(go env GOPATH 2>/dev/null || true)"
+            if [[ -n "$GOPATH" ]]; then
+                GOBIN_PATH="$GOPATH/bin"
+            else
+                GOBIN_PATH="$HOME/go/bin"
+            fi
+        fi
+        if [[ -d "$GOBIN_PATH" && ":$PATH:" != *":$GOBIN_PATH:"* ]]; then
+            export PATH="$PATH:$GOBIN_PATH"
+        fi
+    fi
+}
+
+#  Check Tools (best-effort auto-install)
+check_tools() {
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            install_tool "$tool"
+        fi
+
+        if ! command -v "$tool" &>/dev/null; then
+            echo -e "${RED}[-] $tool is not installed or not in PATH. Please install it.${NC}"
+            echo -e "${YELLOW}    Hint: check the tool's repo or use your distro package manager / go install.${NC}"
+            # continue but warn
+        fi
+    done
+}
+
+# Helpers for timeout selection
+has_timeout() {
+    local tool="$1"
+    for t in "${TIMEOUT_TOOLS[@]}"; do
+        [[ "$t" == "$tool" ]] && return 0
+    done
+    return 1
+}
+
+run() {
+    local tool="$1"
+    local cmd="$2"
+
+    if has_timeout "$tool"; then
+        echo -e "${BLUE}[+] $tool (timeout ${TIMEOUT_DURATION})${NC}"
+        timeout --foreground "$TIMEOUT_DURATION" bash -c "$cmd"
+    else
+        echo -e "${BLUE}[+] $tool${NC}"
+        bash -c "$cmd"
+    fi
+}
+
+# Validation
+validate_domain() {
+    [[ "$1" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  $0 [-l tool1 tool2 ...] [-t timeout] domain.com
+
+Options:
+  -l, --limit     List tools to apply timeout to (e.g. -l gau katana)
+  -t, --timeout   Timeout value (number -> minutes, or specify units: 30s, 5m)
+  -h, --help      Show this help
+
+Examples:
+  $0 -l gau katana -t 10 example.com     # apply 10 minutes timeout to gau & katana
+  $0 example.com                         # default (10m) or no timeouts if -l not provided
+EOF
+    exit 1
+}
+
+# Parse arguments
+DOMAIN=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -l|--limit)
+            shift
+            # collect until next flag or end
+            while [[ $# -gt 0 && ! "$1" =~ ^- ]]; do
+                TIMEOUT_TOOLS+=("$1")
+                shift || break
+            done
+            ;;
+        -t|--timeout)
+            shift
+            if [[ -z "${1:-}" ]]; then usage; fi
+            # if numeric only, interpret as minutes
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                TIMEOUT_DURATION="${1}m"
+            else
+                TIMEOUT_DURATION="$1"
+            fi
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            # assume domain (only one)
+            if [[ -z "$DOMAIN" ]]; then
+                DOMAIN="$1"
+                shift
+            else
+                echo -e "${RED}[-] Unexpected argument: $1${NC}"
+                usage
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$DOMAIN" ]]; then
+    usage
+fi
+
+# Utilities for safe filenames from URL
+safe_filename_from_url() {
+    local url="$1"
+    # md5 + basename for uniqueness
+    local md5
+    if command -v md5sum &>/dev/null; then
+        md5="$(printf '%s' "$url" | md5sum | cut -d' ' -f1)"
+    else
+        md5="$(printf '%s' "$url" | sha1sum | cut -d' ' -f1)"
+    fi
+    local base
+    base="$(basename "${url}" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+    if [[ -z "$base" || "$base" == "/" ]]; then
+        base="file.js"
+    fi
+    printf "%s_%s" "$md5" "$base"
+}
+
+# Main
+main() {
+    banner
+
+    local domain="$DOMAIN"
+
+    if ! validate_domain "$domain"; then
+        echo -e "${RED}[-] Invalid domain: $domain${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}[i] Timeout tools: ${TIMEOUT_TOOLS[*]:-none}${NC}"
+    echo -e "${YELLOW}[i] Timeout duration: ${TIMEOUT_DURATION}${NC}"
+
+    check_tools
+
+    local OUT_DIR="$OUT_BASE/$domain"
+    mkdir -p "$OUT_DIR"/{subs,urls,js,js/endpoints}
+    cd "$OUT_DIR" || exit 1
+
+    echo -e "${GREEN}[✓] Target:${NC} $domain"
+
+    # Subdomains 
+    run subfinder   "subfinder -d $domain -silent > subs/subfinder.txt 2>/dev/null || true"
+    run assetfinder "assetfinder --subs-only $domain > subs/assetfinder.txt 2>/dev/null || true"
+    run findomain   "findomain -t $domain > subs/findomain.txt 2>/dev/null || true"
+
+    # merge unique subs
+    cat subs/*.txt 2>/dev/null | sort -u > subs/all_subs.txt || true
+
+    # fallback: ensure domain present
+    if [[ ! -s subs/all_subs.txt ]]; then
+        echo "$domain" > subs/all_subs.txt
+    fi
+
+    # Live Hosts
+    run httpx "httpx -l subs/all_subs.txt -silent -threads $THREADS > subs/live.txt 2>/dev/null || true"
+
+    # URL Discovery 
+    run katana       "katana -list subs/live.txt -silent > urls/katana.txt 2>/dev/null || true" &
+    run waybackurls  "waybackurls < subs/live.txt > urls/wayback.txt 2>/dev/null || true" &
+    run gau          "gau < subs/live.txt > urls/gau.txt 2>/dev/null || true" &
+    wait
+
+    # merge urls
+    cat urls/*.txt 2>/dev/null | sort -u > urls/all_urls.txt || true
+
+    # Live URLs
+    run httpx "httpx -l urls/all_urls.txt -silent -mc 200,301,302 > urls/live_urls.txt 2>/dev/null || true"
+
+    # JS Files
+    grep -Ei '\.js(\?|$)' urls/all_urls.txt > js/js_links.txt || true
+
+    # jsecrets 
+    if [[ -s js/js_links.txt ]]; then
+        run jsecret "grep '^http' js/js_links.txt | jsecret > js/jsecret_output.txt 2>/dev/null || true"
+    else
+        echo -e "${YELLOW}[!] No JS files found, skipping jsecret${NC}"
+    fi
+
+    #  New: Extract Endpoints from JS 
+    if [[ -s js/js_links.txt ]]; then
+        echo -e "${BLUE}[+] Extracting API endpoints from JS files...${NC}"
+        mkdir -p js/endpoints/files
+        tmp_endpoints="$(mktemp)"
+        : > "$tmp_endpoints"
+
+        # check if linkfinder available
+        if command -v linkfinder &>/dev/null; then
+            LF_PRESENT=true
+            echo -e "${YELLOW}[i] linkfinder detected — will run linkfinder on JS files (slower but thorough)${NC}"
+        else
+            LF_PRESENT=false
+            echo -e "${YELLOW}[i] linkfinder not found — using grep-based extraction only (recommended: pip install linkfinder)${NC}"
+        fi
+
+        # download and scan each JS file
+        while IFS= read -r js_url || [[ -n "$js_url" ]]; do
+            # sanity: skip empty lines
+            [[ -z "$js_url" ]] && continue
+            # only http/https
+            if [[ ! "$js_url" =~ ^https?:// ]]; then
+                # try to normalize if URL is relative to domain
+                if [[ "$js_url" =~ ^/ ]]; then
+                    js_url="https://$domain$js_url"
+                else
+                    continue
+                fi
+            fi
+
+            filename="$(safe_filename_from_url "$js_url")"
+            js_file="js/endpoints/files/$filename"
+            echo -e "${BLUE}[*] Downloading: $js_url${NC}"
+            # limit file to 5MB and add timeouts (best-effort)
+            curl -sL --connect-timeout 10 --max-time 60 --max-filesize 5242880 -o "$js_file" "$js_url" || {
+                echo -e "${YELLOW}[!] Failed or skipped: $js_url${NC}"
+                continue
+            }
+
+            # Basic grep-based extraction (URLs + typical API patterns)
+            # 1) full URLs
+            grep -Eo 'https?://[^\"'\''\)\]\s<>]+' "$js_file" >> "$tmp_endpoints" || true
+            # 2) typical API paths starting with /api or /v1 etc.
+            grep -Eo '(/[A-Za-z0-9_\-\.]{1,}/[A-Za-z0-9_\-\.\/\?=&%]*)' "$js_file" | grep -Ei '/(api|v[0-9]+|graphql|auth|login|user|users|accounts?)' >> "$tmp_endpoints" || true
+            # 3) fetch/XHR/axios patterns (simple)
+            grep -Eo 'fetch\([[:space:]]*["'\'']([^"'\'']+)["'\'']' "$js_file" | sed -E 's/fetch\([[:space:]]*["'\'']([^"'\'']+)["'\'']\).*/\1/' >> "$tmp_endpoints" || true
+            grep -Eo 'axios\.(get|post|put|delete|patch)\([[:space:]]*["'\'']([^"'\'']+)["'\'']' "$js_file" | sed -E "s/axios\.(get|post|put|delete|patch)\([[:space:]]*['\"]([^'\"]+)['\"].*/\2/" >> "$tmp_endpoints" || true
+            grep -Eo 'XMLHttpRequest\(|open\([[:space:]]*["'\''](GET|POST)["'\''],[[:space:]]*["'\'']([^"'\'']+)["'\'']' "$js_file" | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" >> "$tmp_endpoints" || true
+
+            # 4) if linkfinder present, run it (results appended)
+            if [[ "$LF_PRESENT" == "true" ]]; then
+                python3 -m linkfinder -i "$js_file" -o cli -d 2>/dev/null | grep -Eo 'https?://[^\"'\''\)\]\s<>]+' >> "$tmp_endpoints" || true
+            fi
+
+        done < js/js_links.txt
+
+        grep -v -Ei '\.(png|jpg|jpeg|gif|svg|css|woff|woff2|ttf|map|ico)(\?|$)' "$tmp_endpoints" | sed 's/[[:space:]]*$//' | sed 's/^\/\///g' | sort -u > js/endpoints/all_endpoints_raw.txt || true
+
+        : > js/endpoints/all_endpoints.txt
+        while IFS= read -r ep || [[ -n "$ep" ]]; do
+            # skip empty
+            [[ -z "$ep" ]] && continue
+            if [[ "$ep" =~ ^https?:// ]]; then
+                echo "$ep" >> js/endpoints/all_endpoints.txt
+            elif [[ "$ep" =~ ^/ ]]; then
+                echo "https://$domain$ep" >> js/endpoints/all_endpoints.txt
+                echo "$ep" >> js/endpoints/all_endpoints.txt
+            else
+                if [[ "$ep" =~ ^// ]]; then
+                    echo "https:${ep}" >> js/endpoints/all_endpoints.txt
+                else
+                    echo "$ep" >> js/endpoints/all_endpoints.txt
+                fi
+            fi
+        done < js/endpoints/all_endpoints_raw.txt
+
+        sort -u js/endpoints/all_endpoints.txt -o js/endpoints/all_endpoints.txt || true
+
+        rm -f "$tmp_endpoints" || true
+        echo -e "${GREEN}[✓] Extracted endpoints saved in js/endpoints/all_endpoints.txt${NC}"
+        echo -e "${YELLOW}[i] Also saved raw downloaded JS files under js/endpoints/files/ (for manual inspection)${NC}"
+    else
+        echo -e "${YELLOW}[!] No JS files found, skipping endpoint extraction${NC}"
+    fi
+
+    echo -e "${GREEN}[✓] Recon Completed Successfully${NC}"
+    echo -e "${GREEN}[✓] Results saved in:${NC} $OUT_DIR"
+}
+
+main
